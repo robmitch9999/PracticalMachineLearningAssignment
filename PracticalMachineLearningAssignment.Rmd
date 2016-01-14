@@ -1,0 +1,178 @@
+---
+title: "Random Forest yields out of sample accuracy estimate of 99%"
+author: "RAHM"
+date: "January 13, 2016"
+output:
+  html_document:
+    toc: true
+    theme: united
+
+---
+
+#Executive summary
+Data collected from four accelerometers on each of six participants systematically doing curls were analysed with a view to being able to tell whether the participant was doing the curls "properly" or in one of 5 "incorrect" ways.
+
+After only a small amount of manipulation (removing incomplete, irrelevant and not-real-time variables) the Random Forest machine learning algorithm was applied yielding an excellent fit of the data used in "training" (75% of the main dataset). The resulting model was used with the remaining 25% of the dataset to estimate "out of sample" accuracy at 99.6%. 
+
+When applied to the assignment "test" dataset the Random Forest model delivered 20/20 correct predictions.
+
+A review of the influence of the more important variables in the Random Forest model suggests that it may be possible to reduce the number of sensors used, and hence the user-friendliness of the whole setup, as the arm mounted sensor only features once in the top 20 influencers, at position 17.
+
+In addition to the above I learnt that Caret is not perfect, it was extraordinarily slow running the random forest tool, so slow I found it necessary to run the model directly. Further, while Boosting with trees (method = "gbm") through Caret yielded reasonable accuracy (96%) it failed when run in the R Markdown environment.
+
+#The Question and Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. 
+
+In this project, the goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants who were asked to perform barbell lifts correctly and incorrectly in 5 different ways to predict the manner in which they did the exercise. This is the "classe" variable in the training set. 
+
+Any variables may be used to predict with. The task is in two parts:
+
+1. create a report describing how the model was built, how it used cross validation, the expected out of sample error is, and why you made the choices you did. 
+
+2. Use the prediction model to predict 20 different test cases.
+
+# Data preparation & Initial exploration
+
+##Look at the datasets
+A look at the data in the training and testing datasets presented indicates that there are many columns in the testing dataset with no information and those same columns in the training dataset have only a few (406) entries ... so there is no point using those columns in this modelling exercise ... the columns to be dropped (the ones with many missing values in the training dataset) appear to be calculated variables like mean, variance, range, max etc
+Only some of the missing data is labelled "NA" and there are many data points that have been labelled "#DIV/0!", they too need to be ignored.
+
+```{r initialGetData, message=FALSE}
+library(lattice)
+library(ggplot2)
+library(caret)
+library(survival)
+library(splines)
+library(parallel)
+library(randomForest)
+library(gbm)
+library(plyr)
+
+# only need to download the data once
+# activityDataUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+# download.file(activityDataUrl, destfile = "curlTrainingData.csv")
+# activityDataUrl2 <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+# download.file(activityDataUrl2, destfile = "curlTestingData.csv")
+if (!exists("curlData")) {
+  curlData <- read.csv(file = "curlTrainingData.csv")
+}
+```
+
+##Cleaning & Partitioning the data
+
+As indicated above many columns have been removed either as being irrelevant to the test set, being incomplete, being time related or identifying summary data or the name of the participant.
+
+``` {r cleanDataset, message = FALSE}
+# set all blank values to NA
+curlData[curlData==""] <- NA
+# set all divide by zero values to NA
+curlData[curlData=="#DIV/0!"] <- NA
+# keep only columns containing no missing values
+cleanCurlData <- curlData[colSums(is.na(curlData)) == 0]
+# remove the timestamps, names etc
+timelessCleanCurl <- cleanCurlData[, -c(1:7)]
+dim(timelessCleanCurl)
+```
+
+Now to partition the training dataset into a training (75%) and a testing dataset
+
+```{r partitionDataset, message=FALSE}
+set.seed(555)
+inTrain = createDataPartition(timelessCleanCurl$classe, p = 3/4)[[1]]
+curlTraining <- timelessCleanCurl[inTrain,]
+curlTesting <- timelessCleanCurl[-inTrain,]
+dim(curlTraining)
+dim(curlTesting)
+```
+
+## Initial Exploration
+I found it interesting to look for internal correlations, and found a pair of variables that appeared well correlated, but when the appearance of the plot ofthe one vs the other did not encourage me to remove either of them from the analysis:
+```{r correlation, warning=FALSE, message=FALSE}
+internalCorrelation <- cor(curlTraining[,1:52])
+diag(internalCorrelation) <- 0
+which(internalCorrelation > 0.95,arr.ind=T)
+plot(curlTraining$total_accel_belt, curlTraining$roll_belt, col=curlTraining$classe)
+```
+
+A quick look at some of the variables plotted against time suggested that while a time based analysis would be interesting, the form of the test data did not lend itself to estimation of classe based on an evaluation of the data as a time series.
+
+```{r timeplots} 
+par(mfcol = c(3,2))
+
+plot(curlTraining$roll_belt[200:500], col = curlTraining$classe, ylab = "", main = "roll_belt")
+
+plot(curlTraining$yaw_belt[200:500], col = curlTraining$classe, ylab = "", main = "yaw_belt")
+
+plot(curlTraining$pitch_belt[200:500], col = curlTraining$classe, ylab = "", main = "pitch_belt")
+
+plot(curlTraining$magnet_dumbbell_x[200:500], col = curlTraining$classe, ylab = "", main = "magnet_dumbbell_x")
+plot(curlTraining$magnet_dumbbell_y[200:500], col = curlTraining$classe, ylab = "", main = "magnet_dumbbell_y")
+plot(curlTraining$magnet_dumbbell_z[200:500], col = curlTraining$classe, ylab = "", main = "magnet_dumbbell_z")
+par(mfrow = c(1,1))
+
+```
+
+These just happen to be 6 of the 8 most influential variables in the eventual chosen model. NB these are plots of a partitioned dataset so do not represent a complete time series.
+
+## Model choice
+
+My PC runs only slowly, so I will not repeat all of the modelling runs that I used but present just this summary:
+
+1. Simple tree using RPart: ran quite quickly but did not match the training set at all well using the default parameters, unselective for "D"!
+
+2. Boosting with trees: ran slowly, but not too slowly with Caret but crashed when run through RMarkdown! Gave good (96% accuracy) results with my testing set.
+
+3. Random forest: ran too slowly if accessed via Caret, but was really fast when run directly! This also gave better results (99% accuracy) on my testing set
+
+```{r modelChoice, message=FALSE}
+# modelfit1 <- train(curlTraining$classe~., method = "rpart", data = curlTraining)
+# modelfit2 <- train(curlTraining$classe~., method = "rf", data = curlTraining, prox = TRUE)
+# modelfit3 <- train(curlTraining$classe~., method = "gbm", data = curlTraining, verbose = FALSE)
+modelfit4 <- randomForest(classe ~. , data=curlTraining)
+```
+
+*Just for fun* I ran some models using only the rows of data that were marked as "new window", just 406 lines of data. The resulting models using random forest and boosted trees produced excellent fits of the partitioned training data (accuracy = 1) but were poor performers (accuracy ~.7 to .8) in the partitioned testing data, and, previously suggested, of no use with the assignment testing data.
+
+
+#Modelling results
+
+## confusion matrix on training data
+
+The table below is perfect ... seems like overfitting to me
+
+```{r confusionMatrix}
+confusionMatrix(predict(modelfit4, curlTraining), curlTraining$classe)
+
+```
+
+## confusion matrix on test data
+
+The table below gives me confidence, showing as it does an overall accuracy on my partitioned test data of `r round(100* sum(curlTesting$classe == predict(modelfit4, curlTesting))/length(curlTesting$classe), 1)`%
+
+```{r confusionMatrix2}
+confusionMatrix(predict(modelfit4, curlTesting), curlTesting$classe)
+
+```
+
+## Parameters of most importance
+
+Now lets look at what the model did!
+
+It would appear from the figure below that trees in excess of 150 provide little added benefit to the model:
+
+```{r plot1}
+plot(modelfit4, log = "y")
+```
+
+The following figure shows the 20 most important parameters. A computationally simpler model might be available at the cost of some accuracy!
+
+```{r plot2}
+varImpPlot(modelfit4, n.var = 20)
+```
+A review of the above figure (and the full table of relative importance) suggests to me that it would be worth reviewing model performance if no measurements from the "arm" sensor were removed.
+
+*******************
+___________________________________________
+###Citation
+The data used in this assigment and some of the thinking underpinning my analysis can be traced back to the following: Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013. Read more: http://groupware.les.inf.puc-rio.br/har#ixzz3x5ibQBUg
